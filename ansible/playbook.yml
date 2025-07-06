@@ -1,0 +1,252 @@
+---
+- name: Configure Inventory Management System Servers
+  hosts: all
+  become: yes
+  vars:
+    app_name: inventory-management
+    app_user: appuser
+    app_group: appgroup
+    java_version: "11"
+    maven_version: "3.8.4"
+    
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages
+      apt:
+        name:
+          - openjdk-{{ java_version }}-jdk
+          - curl
+          - wget
+          - unzip
+          - git
+          - docker.io
+          - docker-compose
+          - python3-pip
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install Docker Compose via pip
+      pip:
+        name: docker-compose
+        state: present
+
+    - name: Create application user and group
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: yes
+        shell: /bin/bash
+        home: "/home/{{ app_user }}"
+
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+      loop:
+        - "/opt/{{ app_name }}"
+        - "/opt/{{ app_name }}/logs"
+        - "/opt/{{ app_name }}/config"
+        - "/opt/{{ app_name }}/data"
+
+    - name: Download and install Maven
+      block:
+        - name: Download Maven
+          get_url:
+            url: "https://archive.apache.org/dist/maven/maven-3/{{ maven_version }}/binaries/apache-maven-{{ maven_version }}-bin.tar.gz"
+            dest: "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+            mode: '0644'
+
+        - name: Extract Maven
+          unarchive:
+            src: "/tmp/apache-maven-{{ maven_version }}-bin.tar.gz"
+            dest: "/opt"
+            remote_src: yes
+            creates: "/opt/apache-maven-{{ maven_version }}"
+
+        - name: Create Maven symlink
+          file:
+            src: "/opt/apache-maven-{{ maven_version }}"
+            dest: "/opt/maven"
+            state: link
+
+        - name: Set Maven environment variables
+          lineinfile:
+            path: /etc/environment
+            line: "{{ item }}"
+            state: present
+          loop:
+            - "MAVEN_HOME=/opt/maven"
+            - "PATH=$PATH:/opt/maven/bin"
+
+    - name: Configure Docker daemon
+      copy:
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      notify: restart docker
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add user to docker group
+      user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: yes
+
+    - name: Configure firewall
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"    # SSH
+        - "8080"  # Application
+        - "3000"  # Grafana
+        - "8081"  # Graphite
+        - "8082"  # Jenkins
+
+    - name: Configure system limits
+      pam_limits:
+        domain: "{{ app_user }}"
+        limit_type: '-'
+        limit_item: nofile
+        value: 65536
+
+    - name: Configure logrotate for application logs
+      copy:
+        content: |
+          /opt/{{ app_name }}/logs/*.log {
+            daily
+            missingok
+            rotate 7
+            compress
+            delaycompress
+            notifempty
+            create 644 {{ app_user }} {{ app_group }}
+          }
+        dest: /etc/logrotate.d/{{ app_name }}
+        mode: '0644'
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+- name: Deploy Inventory Management Application
+  hosts: app_servers
+  become: yes
+  vars:
+    app_name: inventory-management
+    app_user: appuser
+    docker_image: "{{ app_name }}:latest"
+    
+  tasks:
+    - name: Create application configuration
+      template:
+        src: application.yml.j2
+        dest: "/opt/{{ app_name }}/config/application.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    - name: Create Docker Compose file
+      template:
+        src: docker-compose.yml.j2
+        dest: "/opt/{{ app_name }}/docker-compose.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    - name: Pull latest Docker image
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        force_source: yes
+
+    - name: Deploy application with Docker Compose
+      docker_compose:
+        project_src: "/opt/{{ app_name }}"
+        state: present
+        restarted: yes
+
+    - name: Wait for application to be ready
+      uri:
+        url: "http://localhost:8080/actuator/health"
+        method: GET
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Verify application deployment
+      uri:
+        url: "http://localhost:8080/api/products"
+        method: GET
+        status_code: 200
+      register: api_result
+
+    - name: Display deployment status
+      debug:
+        msg: "Application deployed successfully. API Status: {{ api_result.status }}"
+
+- name: Configure Monitoring
+  hosts: monitoring_servers
+  become: yes
+  vars:
+    grafana_admin_password: "admin123"
+    
+  tasks:
+    - name: Create Grafana configuration
+      template:
+        src: grafana.ini.j2
+        dest: /etc/grafana/grafana.ini
+        mode: '0644'
+      notify: restart grafana
+
+    - name: Create Graphite configuration
+      template:
+        src: carbon.conf.j2
+        dest: /etc/graphite/carbon.conf
+        mode: '0644'
+      notify: restart graphite
+
+    - name: Start monitoring services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - grafana-server
+        - carbon-cache
+
+  handlers:
+    - name: restart grafana
+      systemd:
+        name: grafana-server
+        state: restarted
+
+    - name: restart graphite
+      systemd:
+        name: carbon-cache
+        state: restarted 
